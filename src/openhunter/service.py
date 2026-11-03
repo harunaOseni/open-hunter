@@ -1,0 +1,296 @@
+"""The operations shared by the CLI and the MCP server."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+from openhunter.dns_lookup import DnspythonResolver
+from openhunter.errors import InputError
+from openhunter.github_api import GitHubSource
+from openhunter.http_client import LiveHttp
+from openhunter.models import merge_people, to_plain
+from openhunter.names import split_name
+from openhunter.net import host_is_public, normalize_domain, parse_query
+from openhunter.patterns import KnownEmail, PatternInference, PatternVote, generate_candidates, infer_pattern
+from openhunter.smtp_probe import LiveSmtpProber
+from openhunter.store import Store
+from openhunter.syntax import check_syntax
+from openhunter.verifier import Verification, verify_email
+from openhunter.website import WebsiteSource
+
+SEARCH_TTL_SECONDS = 7 * 24 * 60 * 60
+VERIFY_TTL_SECONDS = 24 * 60 * 60
+HARD_CAP = 100
+
+
+class OpenHunter:
+    def __init__(self, store: Store, website: WebsiteSource, github: GitHubSource, verify, http: object | None = None) -> None:
+        self.store = store
+        self.website = website
+        self.github = github
+        self.verify = verify
+        self._http = http
+
+    def close(self) -> None:
+        closer = getattr(self._http, "close", None)
+        if closer is not None:
+            closer()
+
+    def domain_search(self, query: str, limit: int = 25, refresh: bool = False) -> dict[str, object]:
+        bounded = max(1, min(int(limit), HARD_CAP))
+        parsed = parse_query(query)
+        if parsed.kind == "invalid":
+            raise InputError(parsed.reason or "That query is not a domain or a company name.")
+        notes: list[str] = []
+        hints: list[str] = []
+        if parsed.kind == "company":
+            resolution = self.github.resolve_company(parsed.company or query.strip())
+            notes.extend(resolution.notes)
+            if not resolution.domain:
+                return {
+                    "query": query.strip(),
+                    "domain": None,
+                    "company": parsed.company,
+                    "people": [],
+                    "pattern": None,
+                    "from_cache": False,
+                    "truncated": False,
+                    "emails_found": 0,
+                    "notes": notes,
+                    "suggestions": resolution.suggestions,
+                }
+            domain = resolution.domain
+            hints.extend(resolution.org_hints)
+        else:
+            domain = parsed.domain or ""
+        if not refresh:
+            cached = self.store.get_cache("domain_search", domain)
+            if cached is not None:
+                return _slice(cached, bounded, from_cache=True)
+        website = self.website.discover(domain)
+        notes.extend(website.notes)
+        for org in [*website.github_orgs, *hints]:
+            if org not in hints:
+                hints.append(org)
+        # Website hints must be visible to GitHub even when the company resolver
+        # already contributed one. Rebuild from the website list first.
+        github_hints = list(dict.fromkeys([*website.github_orgs, *hints]))
+        github = self.github.discover(domain, github_hints)
+        notes.extend(github.notes)
+        people = merge_people([*website.people, *github.people])
+        known = [
+            KnownEmail(person.email, person.first_name, person.last_name, person.name)
+            for person in people
+            if person.email
+        ]
+        inference = infer_pattern(domain, known)
+        payload: dict[str, object] = {
+            "query": query.strip(),
+            "domain": domain,
+            "company": website.company_name,
+            "people": [to_plain(person) for person in people[:HARD_CAP]],
+            "pattern": to_plain(inference),
+            "from_cache": False,
+            "truncated": False,
+            "emails_found": sum(1 for person in people if person.email),
+            "notes": notes,
+            "suggestions": [],
+        }
+        self.store.put_cache("domain_search", domain, payload, SEARCH_TTL_SECONDS)
+        return _slice(payload, bounded, from_cache=False)
+
+    def email_pattern(self, domain: str, refresh: bool = False) -> dict[str, object]:
+        found = self.domain_search(domain, limit=HARD_CAP, refresh=refresh)
+        if not found.get("domain"):
+            detail = found.get("notes")
+            message = detail[0] if isinstance(detail, list) and detail else "Could not resolve a domain."
+            raise InputError(str(message))
+        pattern = found.get("pattern")
+        result = dict(pattern) if isinstance(pattern, dict) else {}
+        result["from_cache"] = found["from_cache"]
+        return result
+
+    def email_finder(self, first_name: str, last_name: str, domain: str) -> dict[str, object]:
+        found = self.domain_search(domain, limit=1)
+        if not found.get("domain"):
+            raise InputError("email_finder needs a domain that resolved to a website.")
+        resolved = str(found["domain"])
+        inference = _inference_from(found.get("pattern"), resolved)
+        candidates = generate_candidates(first_name, last_name, resolved, inference)
+        return {
+            "domain": resolved,
+            "first_name": first_name.strip(),
+            "last_name": last_name.strip(),
+            "pattern": found.get("pattern"),
+            "candidates": [to_plain(candidate) for candidate in candidates],
+        }
+
+    def email_verifier(self, email: str, refresh: bool = False) -> dict[str, object]:
+        syntax = check_syntax(email)
+        normalized = syntax.normalized
+        if syntax.ok and normalized and not refresh:
+            cached = self.store.get_cache("verify", normalized)
+            if cached is not None:
+                cached = dict(cached)
+                cached["from_cache"] = True
+                return cached
+        verified = self.verify(email)
+        payload = to_plain(verified)
+        if not isinstance(payload, dict):
+            raise InputError("Verification did not return a result.")
+        if normalized:
+            payload["email"] = normalized
+        payload["from_cache"] = False
+        if syntax.ok and normalized:
+            self.store.put_cache("verify", normalized, payload, VERIFY_TTL_SECONDS)
+        return payload
+
+    def save_lead(
+        self,
+        *,
+        email: str | None = None,
+        name: str | None = None,
+        first_name: str | None = None,
+        last_name: str | None = None,
+        role: str | None = None,
+        company: str | None = None,
+        domain: str | None = None,
+        source_url: str | None = None,
+        confidence: float | None = None,
+        notes: str | None = None,
+    ) -> dict[str, object]:
+        if not any((email, name, first_name, last_name)):
+            raise InputError("A lead needs an email or a name.")
+        if name and not first_name and not last_name:
+            first_name, last_name = split_name(name)
+        full_name = name or " ".join(part for part in (first_name, last_name) if part) or None
+        normalized_domain = domain
+        if domain:
+            try:
+                normalized_domain = normalize_domain(domain)
+            except InputError:
+                normalized_domain = domain.strip().lower()
+        normalized_email = email
+        if email:
+            syntax = check_syntax(email)
+            normalized_email = syntax.normalized or email.strip().lower()
+        return self.store.save_lead(
+            email=normalized_email,
+            full_name=full_name,
+            first_name=first_name,
+            last_name=last_name,
+            role=role,
+            company=company,
+            domain=normalized_domain,
+            source_url=source_url,
+            confidence=confidence,
+            notes=notes,
+        )
+
+    def list_leads(self, domain: str | None = None, limit: int = 100) -> dict[str, object]:
+        normalized = normalize_domain(domain) if domain else None
+        rows = self.store.list_leads(domain=normalized, limit=limit)
+        return {"leads": rows, "count": len(rows)}
+
+    def export_leads(self, path: str, domain: str | None = None) -> dict[str, object]:
+        if "\x00" in path:
+            raise InputError("The export path is not valid.")
+        normalized = normalize_domain(domain) if domain else None
+        count = self.store.export_csv(Path(path), domain=normalized)
+        return {"path": str(Path(path)), "count": count}
+
+    @classmethod
+    def from_env(cls) -> OpenHunter:
+        http = LiveHttp(delay=0.2)
+        token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+        return cls(
+            Store(default_db_path()),
+            WebsiteSource(http),
+            GitHubSource(http, token=token),
+            _live_verifier(),
+            http=http,
+        )
+
+
+def default_db_path() -> Path:
+    configured = os.environ.get("OPENHUNTER_DB")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".local" / "share" / "openhunter" / "openhunter.db"
+
+
+def _slice(payload: dict[str, object], limit: int, *, from_cache: bool) -> dict[str, object]:
+    result = dict(payload)
+    people = list(result.get("people") or [])
+    result["people"] = people[:limit]
+    result["truncated"] = len(people) > limit
+    result["from_cache"] = from_cache
+    return result
+
+
+def _inference_from(payload: object, domain: str) -> PatternInference | None:
+    if not isinstance(payload, dict) or not payload.get("pattern"):
+        return None
+    alternates = []
+    raw_alternates = payload.get("alternates") or []
+    if isinstance(raw_alternates, list):
+        for item in raw_alternates:
+            if isinstance(item, dict) and item.get("pattern"):
+                alternates.append(PatternVote(str(item["pattern"]), int(item.get("matched_count") or 0)))
+    notes = payload.get("notes") or []
+    return PatternInference(
+        domain=str(payload.get("domain") or domain),
+        pattern=str(payload["pattern"]),
+        confidence=float(payload.get("confidence") or 0),
+        sample_count=int(payload.get("sample_count") or 0),
+        matched_count=int(payload.get("matched_count") or 0),
+        alternates=tuple(alternates),
+        method=str(payload.get("method") or "named"),
+        notes=tuple(str(note) for note in notes) if isinstance(notes, list) else (),
+    )
+
+
+def _live_verifier():
+    timeout = _float_env("OPENHUNTER_SMTP_TIMEOUT", 5.0)
+    smtp_enabled = os.environ.get("OPENHUNTER_SMTP", "1").lower() not in {"0", "false", "no", "off"}
+    resolver = DnspythonResolver(timeout=timeout)
+    prober = LiveSmtpProber(timeout=timeout, host_checker=host_is_public)
+    extra = _disposable_file()
+
+    def verify(email: str) -> Verification:
+        return verify_email(
+            email,
+            resolver=resolver,
+            prober=prober,
+            host_checker=host_is_public,
+            disposable_domains=extra,
+            smtp_enabled=smtp_enabled,
+            timeout=timeout,
+        )
+
+    return verify
+
+
+def _disposable_file() -> list[str]:
+    configured = os.environ.get("OPENHUNTER_DISPOSABLE_FILE")
+    if not configured:
+        return []
+    path = Path(configured).expanduser()
+    if not path.is_file():
+        return []
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
