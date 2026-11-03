@@ -18,6 +18,8 @@ class Person:
     confidence: float
     notes: tuple[str, ...] = ()
     is_role: bool = False
+    first_seen: str | None = None
+    last_seen: str | None = None
 
 
 def merge_people(people: list[Person]) -> list[Person]:
@@ -75,7 +77,19 @@ def _prefer(current: Person, incoming: Person) -> Person:
         confidence=max(current.confidence, incoming.confidence),
         notes=notes,
         is_role=current.is_role or incoming.is_role,
+        first_seen=_earliest(current.first_seen, incoming.first_seen),
+        last_seen=_latest(current.last_seen, incoming.last_seen),
     )
+
+
+def _earliest(left: str | None, right: str | None) -> str | None:
+    values = [value for value in (left, right) if value]
+    return min(values) if values else None
+
+
+def _latest(left: str | None, right: str | None) -> str | None:
+    values = [value for value in (left, right) if value]
+    return max(values) if values else None
 
 
 def _name_fields(primary: Person, secondary: Person) -> tuple[str | None, str | None, str | None]:

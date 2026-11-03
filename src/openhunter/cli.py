@@ -121,12 +121,17 @@ def _print_search(payload: dict[str, object]) -> None:
         for person in people:
             if not isinstance(person, dict):
                 continue
+            seen = ""
+            first_seen = person.get("first_seen")
+            if isinstance(first_seen, str) and first_seen:
+                seen = f"  seen {first_seen[:10]}"
             print(
                 "  "
                 + "  ".join(
                     str(person.get(key) or "-")
                     for key in ("name", "role", "email", "confidence", "source", "source_url")
                 )
+                + seen
             )
     notes = payload.get("notes")
     if isinstance(notes, list):

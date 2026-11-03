@@ -5,7 +5,8 @@ from __future__ import annotations
 import pytest
 
 from openhunter.errors import InputError
-from openhunter.net import host_is_public, normalize_domain, parse_query, validate_fetch_url
+from openhunter.http_client import pinned_url
+from openhunter.net import host_is_public, normalize_domain, parse_query, public_addresses, validate_fetch_url
 
 
 def test_normalize_domain_accepts_pasted_urls() -> None:
@@ -66,6 +67,25 @@ def test_host_is_public_uses_the_injected_resolver() -> None:
     assert host_is_public("127.0.0.1", resolve=resolve) is False
     assert host_is_public("192.168.1.9", resolve=resolve) is False
     assert host_is_public("localhost", resolve=resolve) is False
+
+
+def test_public_addresses_prefer_ipv4_and_ignore_private_records() -> None:
+    def resolve(host: str, port: int | None):
+        del host, port
+        return [
+            (0, 0, 0, "", ("not-an-ip", 0)),
+            (0, 0, 0, "", ("10.0.0.8", 0)),
+            (0, 0, 0, "", ("2606:4700::1", 0)),
+            (0, 0, 0, "", ("1.1.1.1", 0)),
+        ]
+
+    assert public_addresses("mixed.example", resolve=resolve) == ["1.1.1.1", "2606:4700::1"]
+    assert host_is_public("mixed.example", resolve=resolve) is True
+
+
+def test_pinned_url_targets_the_validated_address() -> None:
+    assert pinned_url("https://api.github.com/orgs/runpod?x=1", "1.2.3.4") == "https://1.2.3.4/orgs/runpod?x=1"
+    assert pinned_url("https://example.com/a", "2606:4700::1") == "https://[2606:4700::1]/a"
 
 
 def test_validate_fetch_url_stays_on_the_company_site() -> None:

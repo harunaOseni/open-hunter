@@ -9,10 +9,12 @@ from openhunter.dns_lookup import DnspythonResolver
 from openhunter.errors import InputError
 from openhunter.github_api import GitHubSource
 from openhunter.http_client import LiveHttp
-from openhunter.models import merge_people, to_plain
+from openhunter.models import Person, merge_people, to_plain
 from openhunter.names import split_name
 from openhunter.net import host_is_public, normalize_domain, parse_query
 from openhunter.patterns import KnownEmail, PatternInference, PatternVote, generate_candidates, infer_pattern
+from openhunter.roles import is_role_address
+from openhunter.search_web import SearchFindings, WebSearchSource
 from openhunter.smtp_probe import LiveSmtpProber
 from openhunter.store import Store
 from openhunter.syntax import check_syntax
@@ -25,11 +27,20 @@ HARD_CAP = 100
 
 
 class OpenHunter:
-    def __init__(self, store: Store, website: WebsiteSource, github: GitHubSource, verify, http: object | None = None) -> None:
+    def __init__(
+        self,
+        store: Store,
+        website: WebsiteSource,
+        github: GitHubSource,
+        verify,
+        search: WebSearchSource | None = None,
+        http: object | None = None,
+    ) -> None:
         self.store = store
         self.website = website
         self.github = github
         self.verify = verify
+        self.search = search
         self._http = http
 
     def close(self) -> None:
@@ -70,21 +81,36 @@ class OpenHunter:
                 return _slice(cached, bounded, from_cache=True)
         website = self.website.discover(domain)
         notes.extend(website.notes)
+        search = self.search.discover(domain) if self.search is not None else SearchFindings([], [])
+        notes.extend(search.notes)
         for org in [*website.github_orgs, *hints]:
             if org not in hints:
                 hints.append(org)
-        # Website hints must be visible to GitHub even when the company resolver
-        # already contributed one. Rebuild from the website list first.
+        # The domain stem is always tried first inside GitHub discovery. Hints
+        # from the website are extra names, not a replacement for that stem.
         github_hints = list(dict.fromkeys([*website.github_orgs, *hints]))
         github = self.github.discover(domain, github_hints)
         notes.extend(github.notes)
-        people = merge_people([*website.people, *github.people])
+        fresh = merge_people([*website.people, *search.people, *github.people])
+        self.store.upsert_addresses([_observation(person) for person in fresh])
+        indexed = [_person_from_index(row) for row in self.store.addresses_for_domain(domain)]
+        people = merge_people([*fresh, *indexed])
         known = [
             KnownEmail(person.email, person.first_name, person.last_name, person.name)
             for person in people
             if person.email
         ]
         inference = infer_pattern(domain, known)
+        lookup_failed = bool(
+            getattr(website, "lookup_failed", False)
+            or getattr(github, "lookup_failed", False)
+            or search.lookup_failed
+        )
+        fresh_emails = any(person.email for person in fresh)
+        if lookup_failed and not fresh_emails:
+            notes.append("This lookup was not cached because a source could not be reached.")
+        if not people and not lookup_failed:
+            notes.append("No public people or addresses were found in the sources that responded.")
         payload: dict[str, object] = {
             "query": query.strip(),
             "domain": domain,
@@ -94,10 +120,12 @@ class OpenHunter:
             "from_cache": False,
             "truncated": False,
             "emails_found": sum(1 for person in people if person.email),
+            "index_count": len(indexed),
             "notes": notes,
             "suggestions": [],
         }
-        self.store.put_cache("domain_search", domain, payload, SEARCH_TTL_SECONDS)
+        if not (lookup_failed and not fresh_emails):
+            self.store.put_cache("domain_search", domain, payload, SEARCH_TTL_SECONDS)
         return _slice(payload, bounded, from_cache=False)
 
     def email_pattern(self, domain: str, refresh: bool = False) -> dict[str, object]:
@@ -209,6 +237,7 @@ class OpenHunter:
             WebsiteSource(http),
             GitHubSource(http, token=token),
             _live_verifier(),
+            search=WebSearchSource.from_env(http),
             http=http,
         )
 
@@ -218,6 +247,39 @@ def default_db_path() -> Path:
     if configured:
         return Path(configured).expanduser()
     return Path.home() / ".local" / "share" / "openhunter" / "openhunter.db"
+
+
+def _observation(person: Person) -> dict[str, object]:
+    return {
+        "email": person.email,
+        "source": person.source,
+        "source_url": person.source_url,
+        "name": person.name,
+        "first_name": person.first_name,
+        "last_name": person.last_name,
+        "role": person.role,
+        "confidence": person.confidence,
+    }
+
+
+def _person_from_index(row: dict[str, object]) -> Person:
+    email = str(row.get("email") or "")
+    name = row.get("name") if isinstance(row.get("name"), str) else None
+    role = row.get("role") if isinstance(row.get("role"), str) else None
+    return Person(
+        name=name,
+        first_name=row.get("first_name") if isinstance(row.get("first_name"), str) else None,
+        last_name=row.get("last_name") if isinstance(row.get("last_name"), str) else None,
+        role=role,
+        email=email or None,
+        source=str(row.get("source") or "index"),
+        source_url=str(row.get("source_url") or ""),
+        confidence=float(row.get("confidence") or 0),
+        notes=(),
+        is_role=is_role_address(email) if email else False,
+        first_seen=str(row.get("first_seen") or "") or None,
+        last_seen=str(row.get("last_seen") or "") or None,
+    )
 
 
 def _slice(payload: dict[str, object], limit: int, *, from_cache: bool) -> dict[str, object]:

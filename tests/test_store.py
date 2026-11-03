@@ -16,6 +16,45 @@ def test_cache_expires_and_does_not_return_other_keys(tmp_path) -> None:
     assert store.get_cache("pattern", "ada@example.com", now=start) is None
 
 
+def test_address_index_keeps_the_first_seen_time(tmp_path) -> None:
+    store = Store(tmp_path / "openhunter.db")
+    first = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    later = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    store.upsert_addresses(
+        [
+            {
+                "email": "Ada@Runpod.io",
+                "source": "website_text",
+                "source_url": "https://news.example/story",
+                "name": None,
+                "confidence": 0.6,
+            }
+        ],
+        now=first,
+    )
+    store.upsert_addresses(
+        [
+            {
+                "email": "ada@runpod.io",
+                "source": "website_text",
+                "source_url": "https://news.example/story",
+                "name": "Ada Lovelace",
+                "first_name": "Ada",
+                "last_name": "Lovelace",
+                "confidence": 0.4,
+            }
+        ],
+        now=later,
+    )
+    rows = store.addresses_for_domain("runpod.io")
+    assert len(rows) == 1
+    assert rows[0]["first_seen"] == first.isoformat()
+    assert rows[0]["last_seen"] == later.isoformat()
+    assert rows[0]["name"] == "Ada Lovelace"
+    assert rows[0]["confidence"] == 0.6
+    assert store.addresses_for_domain("other.example") == []
+
+
 def test_lead_upsert_list_filter_and_csv(tmp_path) -> None:
     store = Store(tmp_path / "openhunter.db")
     hostile = "Ada'; DROP TABLE leads;--"

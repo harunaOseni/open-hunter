@@ -47,6 +47,21 @@ class Store:
                     ttl_seconds INTEGER NOT NULL,
                     PRIMARY KEY (kind, cache_key)
                 );
+                CREATE TABLE IF NOT EXISTS address_index (
+                    email TEXT NOT NULL,
+                    domain TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    name TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    role TEXT,
+                    confidence REAL NOT NULL,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    PRIMARY KEY (email, source_url)
+                );
+                CREATE INDEX IF NOT EXISTS address_index_domain ON address_index (domain, last_seen);
                 CREATE TABLE IF NOT EXISTS leads (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     dedupe_key TEXT NOT NULL UNIQUE,
@@ -108,6 +123,65 @@ class Store:
                 (kind, key, encoded, moment.isoformat(), ttl_seconds),
             )
             connection.commit()
+
+    def upsert_addresses(self, rows: list[dict[str, object]], *, now: datetime | None = None) -> int:
+        """Remember public addresses. The first time is kept; later sightings refresh last_seen."""
+        moment = (now or _now()).isoformat()
+        written = 0
+        with closing(self._connect()) as connection:
+            for row in rows:
+                email = str(row.get("email") or "").strip().lower()
+                source_url = str(row.get("source_url") or "").strip()
+                if not email or "@" not in email or not source_url:
+                    continue
+                domain = email.rsplit("@", 1)[1]
+                connection.execute(
+                    """
+                    INSERT INTO address_index (
+                        email, domain, source, source_url, name, first_name, last_name, role,
+                        confidence, first_seen, last_seen
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(email, source_url) DO UPDATE SET
+                        last_seen = excluded.last_seen,
+                        name = COALESCE(address_index.name, excluded.name),
+                        first_name = COALESCE(address_index.first_name, excluded.first_name),
+                        last_name = COALESCE(address_index.last_name, excluded.last_name),
+                        role = COALESCE(address_index.role, excluded.role),
+                        confidence = MAX(address_index.confidence, excluded.confidence)
+                    """,
+                    (
+                        email,
+                        domain,
+                        str(row.get("source") or "index"),
+                        source_url,
+                        row.get("name"),
+                        row.get("first_name"),
+                        row.get("last_name"),
+                        row.get("role"),
+                        float(row.get("confidence") or 0),
+                        moment,
+                        moment,
+                    ),
+                )
+                written += 1
+            connection.commit()
+        return written
+
+    def addresses_for_domain(self, domain: str, *, limit: int = 200) -> list[dict[str, object]]:
+        bounded = max(1, min(int(limit), 500))
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT email, domain, source, source_url, name, first_name, last_name, role,
+                       confidence, first_seen, last_seen
+                FROM address_index
+                WHERE domain = ?
+                ORDER BY confidence DESC, last_seen DESC
+                LIMIT ?
+                """,
+                (domain.strip().lower(), bounded),
+            ).fetchall()
+        return [{key: row[key] for key in row.keys()} for row in rows]
 
     def save_lead(
         self,

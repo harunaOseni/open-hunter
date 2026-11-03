@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from openhunter.github_api import CompanyResolution, GitHubFindings
+from openhunter.search_web import SearchFindings
 from openhunter.models import Person
 from openhunter.service import OpenHunter
 from openhunter.store import Store
@@ -117,6 +118,79 @@ def test_pattern_and_finder_reuse_discovery(tmp_path) -> None:
     assert found["candidates"][0]["email"] == "grace.hopper@example.com"
     assert found["pattern"]["pattern"] == "first.last"
     assert website.calls == ["example.com"]
+
+
+class FailingGitHub:
+    def discover(self, domain: str, org_hints: list[str]) -> GitHubFindings:
+        del domain, org_hints
+        return GitHubFindings([], ["Tried GitHub organization 'example': timeout."], None, True)
+
+    def resolve_company(self, name: str) -> CompanyResolution:
+        raise AssertionError(name)
+
+
+class FakeSearch:
+    def discover(self, domain: str) -> SearchFindings:
+        del domain
+        return SearchFindings(
+            [
+                _person("ada.lovelace@example.com", "Ada Lovelace", None, "web_search", 0.7),
+            ],
+            ["search ok"],
+        )
+
+
+def test_indexed_addresses_are_reused_for_pattern_inference(tmp_path) -> None:
+    store = Store(tmp_path / "db.sqlite")
+    for email, name in (("ada.lovelace@example.com", "Ada Lovelace"), ("grace.hopper@example.com", "Grace Hopper")):
+        first, last = name.split(" ", 1)
+        store.upsert_addresses(
+            [
+                {
+                    "email": email,
+                    "source": "web_search",
+                    "source_url": f"https://news.example/{first}",
+                    "name": name,
+                    "first_name": first,
+                    "last_name": last,
+                    "confidence": 0.7,
+                }
+            ]
+        )
+    service = OpenHunter(store, FakeWebsite([]), FakeGitHub([]), verify=lambda email: _unused(email))
+    result = service.domain_search("example.com")
+    assert result["emails_found"] == 2
+    assert result["index_count"] == 2
+    assert result["pattern"]["pattern"] == "first.last"
+    assert result["pattern"]["method"] == "named"
+    assert any(person["first_seen"] for person in result["people"])
+
+
+def test_search_results_are_merged_and_indexed(tmp_path) -> None:
+    service = OpenHunter(
+        Store(tmp_path / "db.sqlite"),
+        FakeWebsite([]),
+        FakeGitHub([]),
+        verify=lambda email: _unused(email),
+        search=FakeSearch(),
+    )
+    result = service.domain_search("example.com")
+    assert result["emails_found"] == 1
+    assert result["people"][0]["source"] == "web_search"
+    assert "search ok" in result["notes"]
+    again = service.domain_search("example.com", refresh=True)
+    assert again["index_count"] == 1
+    assert again["people"][0]["email"] == "ada.lovelace@example.com"
+
+
+def test_transport_failure_is_not_cached(tmp_path) -> None:
+    website = FakeWebsite([])
+    service = OpenHunter(Store(tmp_path / "db.sqlite"), website, FailingGitHub(), verify=lambda email: _unused(email))
+    first = service.domain_search("example.com")
+    second = service.domain_search("example.com")
+    assert any("not cached" in str(note).lower() for note in first["notes"])
+    assert website.calls == ["example.com", "example.com"]
+    assert second["from_cache"] is False
 
 
 def test_company_query_uses_the_resolved_domain(tmp_path) -> None:

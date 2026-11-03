@@ -62,12 +62,14 @@ def build_server() -> MCPServer:
     def domain_search(domain: str, limit: int = 25, refresh: bool = False) -> dict[str, Any]:
         """Find public people and emails for a company domain or company name.
 
-        Sources are the company website (team, about, contact, security.txt) and
-        the GitHub organization linked from that site or matching the domain:
-        public members, public profile emails, and commit author emails. GitHub
-        noreply addresses are omitted. Returns name, role, email, source URL,
-        and confidence. Email may be null when a person is public but no mailbox
-        is. Set GITHUB_TOKEN to raise the GitHub rate limit.
+        Sources are the company website (including sitemap.xml, blog, press,
+        careers, and a few linked PDFs), public web search for addresses on the
+        domain, and the GitHub organization for that domain: public members,
+        profile emails, and commit authors. A local index remembers every
+        address with its source URL and first/last seen time, and later lookups
+        reuse it. GitHub noreply addresses are omitted. Set GITHUB_TOKEN to raise
+        the GitHub rate limit. BRAVE_SEARCH_API_KEY or SEARXNG_URL selects a
+        search backend; otherwise DuckDuckGo's HTML endpoint is used.
         """
         return _call(lambda service: service.domain_search(domain, limit=limit, refresh=refresh))
 

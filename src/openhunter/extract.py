@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+import zlib
+from dataclasses import dataclass, field
+from html import unescape
 from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
@@ -30,9 +32,10 @@ _OBFUSCATED_PLAIN_DOMAIN_RE = re.compile(
     re.IGNORECASE,
 )
 _GITHUB_RE = re.compile(
-    r"https?://github\.com/([A-Za-z0-9_.-]+)(?:/([A-Za-z0-9_.-]+))?",
+    r"(?<![\w@])(?:(?:https?:)?//)?(?:www\.)?github\.com/([A-Za-z0-9_.-]+)(?:/([A-Za-z0-9_.-]+))?",
     re.IGNORECASE,
 )
+_SITEMAP_LOC_RE = re.compile(r"<loc>\s*([^<]+)\s*</loc>", re.IGNORECASE)
 _FILE_TLDS = frozenset({"png", "jpg", "jpeg", "gif", "svg", "webp", "css", "js", "ico", "woff", "woff2"})
 _RESERVED_GITHUB = frozenset(
     {
@@ -64,7 +67,20 @@ _RESERVED_GITHUB = frozenset(
         "account",
     }
 )
-_FOLLOW_TOKENS = ("team", "about", "people", "leadership", "contact", "staff", "company")
+_FOLLOW_TOKENS = (
+    "team",
+    "about",
+    "people",
+    "leadership",
+    "contact",
+    "staff",
+    "company",
+    "blog",
+    "press",
+    "news",
+    "career",
+    "job",
+)
 _NAME_STOP = frozenset(
     {"the", "team", "email", "contact", "say", "hello", "mail", "reach", "click", "here", "our", "us"}
 )
@@ -76,6 +92,7 @@ class PageExtract:
     github_orgs: list[str]
     company_name: str | None
     follow_links: list[str]
+    pdf_links: list[str] = field(default_factory=list)
 
 
 def extract_page(text: str, url: str, domain: str) -> PageExtract:
@@ -85,6 +102,8 @@ def extract_page(text: str, url: str, domain: str) -> PageExtract:
     if path.endswith("humans.txt"):
         people = _emails_from_text(text, url, domain, source="humans_txt", confidence=0.6)
         return PageExtract(people, [], None, [])
+    if path.endswith(".pdf"):
+        return PageExtract(extract_pdf(text, b"", url, domain), [], None, [])
     return _from_html(text, url, domain)
 
 
@@ -107,6 +126,7 @@ def _from_html(text: str, url: str, domain: str) -> PageExtract:
         _github_orgs(text),
         company,
         _follow_links(soup, url, domain),
+        _pdf_links(soup, url, domain),
     )
 
 
@@ -182,6 +202,29 @@ def _security_contacts(text: str, url: str, domain: str) -> list[Person]:
             for address in _mailto_addresses(value):
                 _add_email(found, address, url, domain, "security_txt", 0.7, None)
     return list(found.values())
+
+
+def parse_sitemap_locs(text: str) -> list[str]:
+    return [unescape(item).strip() for item in _SITEMAP_LOC_RE.findall(text) if item.strip()]
+
+
+def extract_pdf(text: str, raw: bytes, url: str, domain: str) -> list[Person]:
+    blob = text
+    if raw:
+        blob = f"{blob}\n{_pdf_text(raw)}"
+    return _emails_from_text(blob, url, domain, "website_pdf", 0.65)
+
+
+def _pdf_text(raw: bytes) -> str:
+    chunks = [raw.decode("latin-1", errors="ignore")]
+    for match in re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", raw, re.DOTALL):
+        data = match.group(1).strip(b"\r\n")
+        try:
+            inflated = zlib.decompress(data)
+        except zlib.error:
+            continue
+        chunks.append(inflated.decode("latin-1", errors="ignore"))
+    return "\n".join(chunks)
 
 
 def _emails_from_text(text: str, url: str, domain: str, source: str, confidence: float) -> list[Person]:
@@ -297,6 +340,27 @@ def _github_orgs(text: str) -> list[str]:
         if key not in seen:
             seen.add(key)
             found.append(login)
+    return found
+
+
+def _pdf_links(soup: BeautifulSoup, url: str, domain: str) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for anchor in soup.find_all("a", href=True):
+        href = str(anchor.get("href") or "")
+        if href.startswith(("mailto:", "javascript:", "#")):
+            continue
+        absolute = urljoin(url, href)
+        parts = urlsplit(absolute)
+        host = (parts.hostname or "").lower()
+        if parts.scheme != "https" or not same_site(host, domain):
+            continue
+        if not parts.path.lower().endswith(".pdf"):
+            continue
+        canonical = urlunsplit(("https", host, parts.path, "", ""))
+        if canonical not in seen:
+            seen.add(canonical)
+            found.append(canonical)
     return found
 
 

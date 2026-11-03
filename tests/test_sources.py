@@ -212,6 +212,63 @@ def test_github_rate_limit_returns_a_note_instead_of_raising() -> None:
     assert not any("/repos" in call for call in http.calls)
 
 
+def test_domain_stem_is_queried_before_unrelated_github_hints() -> None:
+    http = PrefixHttp([("https://api.github.com/orgs/runpod", 200, json.dumps(ORG), None)])
+    hints = [f"sponsor{index}" for index in range(6)]
+    found = GitHubSource(http, token=None).discover("runpod.io", hints)
+    assert http.calls[0].startswith("https://api.github.com/orgs/runpod")
+    assert any(person.email == "press@runpod.io" for person in found.people)
+    assert not found.lookup_failed
+
+
+def test_github_transport_failure_names_the_org_it_tried() -> None:
+    http = PrefixHttp([("https://api.github.com/orgs/runpod", 0, "", None)])
+    found = GitHubSource(http, token=None).discover("runpod.io", org_hints=[])
+    text = " ".join(found.notes)
+    assert found.people == []
+    assert found.lookup_failed is True
+    assert "No GitHub organization found for runpod.io" in text
+    assert "Tried GitHub organization 'runpod'" in text
+    assert "https://api.github.com/orgs/runpod" in text
+    assert not any("/repos" in call for call in http.calls)
+
+
+def test_company_name_uses_org_search_when_the_obvious_slug_is_missing() -> None:
+    org = {
+        "login": "runpod-inc",
+        "name": "Runpod",
+        "blog": "https://www.runpod.io",
+        "email": None,
+        "html_url": "https://github.com/runpod-inc",
+    }
+    http = PrefixHttp(
+        [
+            ("https://api.github.com/orgs/runpod-inc", 200, json.dumps(org), None),
+            ("https://api.github.com/orgs/runpod", 404, "", None),
+            (
+                "https://api.github.com/search/users",
+                200,
+                json.dumps({"items": [{"login": "runpod-inc"}]}),
+                None,
+            ),
+        ]
+    )
+    resolved = GitHubSource(http, token=None).resolve_company("Runpod")
+    assert resolved.domain == "runpod.io"
+    assert resolved.org_hints == ["runpod-inc"]
+    assert any(call.startswith("https://api.github.com/search/users") for call in http.calls)
+
+
+def test_unresolved_company_says_what_was_tried() -> None:
+    http = PrefixHttp([])
+    resolved = GitHubSource(http, token=None).resolve_company("Runpod")
+    text = " ".join(resolved.notes)
+    assert resolved.domain is None
+    assert "Tried GitHub organization 'runpod'" in text
+    assert "GitHub org search" in text
+    assert "Could not resolve a public website for Runpod" in text
+
+
 def test_company_name_resolves_through_the_org_website() -> None:
     http = PrefixHttp(
         [("https://api.github.com/orgs/runpod", 200, json.dumps(ORG), None)]
@@ -219,3 +276,57 @@ def test_company_name_resolves_through_the_org_website() -> None:
     resolved = GitHubSource(http, token=None).resolve_company("Runpod")
     assert resolved.domain == "runpod.io"
     assert "runpod" in resolved.org_hints
+    assert not any("search/users" in call for call in http.calls)
+
+
+SITEMAP = """<urlset>
+<url><loc>https://example.com/press/launch</loc></url>
+<url><loc>https://example.com/files/team.pdf</loc></url>
+</urlset>"""
+
+
+def test_sitemap_and_pdf_addresses_are_collected() -> None:
+    http = PrefixHttp(
+        [
+            ("https://example.com/sitemap.xml", 200, SITEMAP, {"content-type": "application/xml"}),
+            (
+                "https://example.com/press/launch",
+                200,
+                "<p>Press ada.lovelace@example.com</p><a href='/files/team.pdf'>PDF</a>",
+                None,
+            ),
+            (
+                "https://example.com/files/team.pdf",
+                200,
+                "Team roster grace.hopper@example.com",
+                {"content-type": "application/pdf"},
+            ),
+            ("https://example.com/", 200, "<html></html>", None),
+        ]
+    )
+    found = WebsiteSource(http).discover("example.com")
+    emails = {person.email for person in found.people}
+    assert "ada.lovelace@example.com" in emails
+    assert "grace.hopper@example.com" in emails
+    pdf = next(person for person in found.people if person.email == "grace.hopper@example.com")
+    assert pdf.source == "website_pdf"
+    assert pdf.source_url == "https://example.com/files/team.pdf"
+
+
+def test_website_tries_www_when_the_apex_does_not_answer() -> None:
+    http = PrefixHttp(
+        [
+            (
+                "https://www.example.com/",
+                200,
+                "<p>ada@example.com</p><a href='https://github.com/acme'>GitHub</a>",
+                None,
+            ),
+            ("https://example.com/", 0, "", None),
+        ]
+    )
+    found = WebsiteSource(http).discover("example.com")
+    assert any(person.email == "ada@example.com" for person in found.people)
+    assert found.github_orgs == ["acme"]
+    assert any("Could not fetch https://example.com/" in note for note in found.notes)
+    assert found.lookup_failed is False

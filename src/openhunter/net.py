@@ -75,6 +75,17 @@ def parse_query(value: str) -> ParsedQuery:
 
 
 def host_is_public(host: str, *, resolve: Resolve | None = None) -> bool:
+    return bool(public_addresses(host, resolve=resolve))
+
+
+def public_addresses(host: str, *, resolve: Resolve | None = None) -> list[str]:
+    """Global addresses for a host, IPv4 first.
+
+    One private or unreadable record does not hide a public one. Callers connect
+    to an address from this list instead of asking the OS to resolve again, so a
+    broken IPv6 answer or a mixed DNS reply cannot turn a public host into a miss
+    or a private one into a target.
+    """
     cleaned = host.strip().lower().rstrip(".")
     if (
         not cleaned
@@ -83,26 +94,38 @@ def host_is_public(host: str, *, resolve: Resolve | None = None) -> bool:
         or cleaned.endswith(".local")
         or cleaned.endswith(".internal")
     ):
-        return False
+        return []
     try:
-        address = ipaddress.ip_address(cleaned)
+        literal = ipaddress.ip_address(cleaned)
     except ValueError:
-        resolver = resolve or _resolve
+        literal = None
+    if literal is not None:
+        return [cleaned] if literal.is_global else []
+    resolver = resolve or _resolve
+    try:
+        infos = resolver(cleaned, None)
+    except socket.gaierror:
+        return []
+    ipv4: list[str] = []
+    ipv6: list[str] = []
+    for info in infos:
+        # getaddrinfo returns (family, type, proto, canonname, sockaddr).
+        # The sockaddr is the last item; indexing [3] reads the canonname.
         try:
-            infos = resolver(cleaned, None)
-        except socket.gaierror:
-            return False
-        addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
-        for info in infos:
-            # getaddrinfo returns (family, type, proto, canonname, sockaddr).
-            # The sockaddr is the last item; indexing [3] reads the canonname.
-            try:
-                sockaddr = info[-1]
-                addresses.append(ipaddress.ip_address(sockaddr[0]))
-            except (IndexError, TypeError, ValueError):
-                return False
-        return bool(addresses) and all(item.is_global for item in addresses)
-    return bool(address.is_global)
+            sockaddr = info[-1]
+            raw = sockaddr[0]
+            if not isinstance(raw, str):
+                continue
+            parsed = ipaddress.ip_address(raw.split("%", 1)[0])
+        except (IndexError, TypeError, ValueError):
+            continue
+        if not parsed.is_global:
+            continue
+        text = str(parsed)
+        bucket = ipv4 if parsed.version == 4 else ipv6
+        if text not in bucket:
+            bucket.append(text)
+    return [*ipv4, *ipv6]
 
 
 def validate_fetch_url(url: str, *, domain: str, resolve: Resolve | None = None) -> str | None:

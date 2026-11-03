@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, replace
+from urllib.parse import quote
 
 from openhunter.errors import InputError
 from openhunter.http_client import USER_AGENT, FetchResult
@@ -34,6 +35,7 @@ class GitHubFindings:
     people: list[Person]
     notes: list[str]
     org_login: str | None
+    lookup_failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,47 +53,79 @@ class GitHubSource:
 
     def discover(self, domain: str, org_hints: list[str]) -> GitHubFindings:
         notes: list[str] = []
+        attempts: list[str] = []
         slugs = _slug_list(org_hints, domain)
         hinted = {slug.lower() for slug in org_hints}
         org: dict[str, object] | None = None
-        for slug in slugs[:6]:
-            payload, status, note = self._get_json(f"{_API}/orgs/{slug}")
-            if note and "rate limit" in note.lower():
-                notes.append(note)
-                return GitHubFindings([], notes, None)
-            if status == 200 and isinstance(payload, dict) and _accept_org(payload, domain, slug, slug in hinted):
+        failed = False
+        for slug in slugs:
+            payload, status, detail, failed_request = self._org_payload(slug, attempts)
+            failed = failed or failed_request
+            if detail and "rate limit" in detail.lower():
+                notes.append(detail)
+                notes.extend(attempts)
+                return GitHubFindings([], notes, None, lookup_failed=True)
+            if isinstance(payload, dict) and _accept_org(payload, domain, slug, slug in hinted):
                 org = payload
                 break
+            if isinstance(payload, dict):
+                attempts.append(_rejected_org(payload, domain, slug))
         if org is None:
             notes.append(f"No GitHub organization found for {domain}.")
-            return GitHubFindings([], notes, None)
+            notes.extend(attempts)
+            if not slugs:
+                notes.append("No GitHub organization name could be derived from the domain.")
+            return GitHubFindings([], notes, None, lookup_failed=failed)
         return self._from_org(org, domain, notes)
 
     def resolve_company(self, name: str) -> CompanyResolution:
         notes: list[str] = []
         suggestions: list[str] = []
-        for slug in _company_slugs(name):
-            payload, status, note = self._get_json(f"{_API}/orgs/{slug}")
-            if note and "rate limit" in note.lower():
-                notes.append(note)
-                break
-            if status == 200 and isinstance(payload, dict):
-                domain = _blog_domain(payload) or _email_domain(_string(payload.get("email")))
-                login = _string(payload.get("login")) or slug
-                if domain:
-                    return CompanyResolution(
-                        domain=domain,
-                        org_hints=[login],
-                        notes=["Resolved the company website from the GitHub organization profile."],
-                        suggestions=[],
-                    )
-                suggestions.append(login)
-                notes.append(f"GitHub org {login} has no public website.")
-        if not notes:
-            notes.append(f"Could not resolve a public website for {name}. Pass a domain instead.")
-        elif not any("Pass a domain" in note or "rate limit" in note.lower() for note in notes):
+        attempts: list[str] = []
+        tried: set[str] = set()
+        resolved = self._resolve_slugs(_company_slugs(name), tried, attempts, suggestions)
+        if isinstance(resolved, CompanyResolution):
+            return resolved
+        if any("rate limit" in note.lower() for note in attempts):
+            notes.extend(attempts)
+            return CompanyResolution(None, [], notes, suggestions)
+        resolved = self._resolve_slugs(self._search_logins(name, attempts), tried, attempts, suggestions)
+        if isinstance(resolved, CompanyResolution):
+            return resolved
+        notes.extend(attempts)
+        if not any("rate limit" in note.lower() for note in notes):
             notes.append(f"Could not resolve a public website for {name}. Pass a domain instead.")
         return CompanyResolution(None, [], notes, suggestions)
+
+    def _resolve_slugs(
+        self,
+        slugs: list[str],
+        tried: set[str],
+        attempts: list[str],
+        suggestions: list[str],
+    ) -> CompanyResolution | None:
+        for slug in slugs:
+            if slug.lower() in tried:
+                continue
+            tried.add(slug.lower())
+            payload, _status, detail, _failed = self._org_payload(slug, attempts)
+            if detail and "rate limit" in detail.lower():
+                attempts.append(detail)
+                return None
+            if not isinstance(payload, dict):
+                continue
+            domain = _blog_domain(payload) or _email_domain(_string(payload.get("email")))
+            login = _string(payload.get("login")) or slug
+            if domain:
+                return CompanyResolution(
+                    domain=domain,
+                    org_hints=[login],
+                    notes=["Resolved the company website from the GitHub organization profile."],
+                    suggestions=[],
+                )
+            suggestions.append(login)
+            attempts.append(f"GitHub org {login} has no public website or company email.")
+        return None
 
     def _from_org(self, org: dict[str, object], domain: str, notes: list[str]) -> GitHubFindings:
         login = _string(org.get("login")) or ""
@@ -184,6 +218,43 @@ class GitHubSource:
             return payload, None
         return [], None
 
+    def _org_payload(
+        self, slug: str, attempts: list[str]
+    ) -> tuple[dict[str, object] | None, int, str | None, bool]:
+        url = f"{_API}/orgs/{slug}"
+        payload, status, detail = self._get_json(url)
+        failed = _transport_failure(status, detail)
+        if isinstance(payload, dict):
+            return payload, status, detail, failed
+        if detail and "rate limit" in detail.lower():
+            return None, status, detail, True
+        attempts.append(f"Tried GitHub organization '{slug}' at {url}: {detail or f'HTTP {status}'}.")
+        return None, status, detail, failed
+
+    def _search_logins(self, name: str, attempts: list[str]) -> list[str]:
+        query = quote(f"{name} type:org")
+        url = f"{_API}/search/users?q={query}&per_page=5"
+        payload, status, detail = self._get_json(url)
+        if detail and "rate limit" in detail.lower():
+            attempts.append(detail)
+            return []
+        if not isinstance(payload, dict):
+            attempts.append(f"Tried GitHub org search for {name!r}: {detail or f'HTTP {status}'}.")
+            return []
+        logins: list[str] = []
+        items = payload.get("items")
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict):
+                    login = _string(item.get("login"))
+                    if login:
+                        logins.append(login)
+        if logins:
+            attempts.append(f"GitHub org search for {name!r} returned {', '.join(logins)}.")
+        else:
+            attempts.append(f"GitHub org search for {name!r} returned no organizations.")
+        return logins
+
     def _get_json(self, url: str) -> tuple[object | None, int, str | None]:
         getter = getattr(self.http, "get_text")
         result: FetchResult = getter(url, headers=_headers(self.token), timeout=15)
@@ -191,7 +262,8 @@ class GitHubSource:
         if result.status in {403, 429} or headers.get("x-ratelimit-remaining") == "0":
             return None, result.status, "GitHub API rate limit reached; set GITHUB_TOKEN for a higher quota."
         if result.status != 200 or not result.text:
-            return None, result.status, None
+            detail = result.error or (f"HTTP {result.status}" if result.status else "no response")
+            return None, result.status, detail
         try:
             return json.loads(result.text), result.status, None
         except json.JSONDecodeError:
@@ -372,6 +444,7 @@ def _company_slugs(name: str) -> list[str]:
 
 
 def _slug_list(hints: list[str], domain: str) -> list[str]:
+    """Domain stem first, then page hints. The stem is never crowded out."""
     slugs: list[str] = []
 
     def add(value: str) -> None:
@@ -379,12 +452,33 @@ def _slug_list(hints: list[str], domain: str) -> list[str]:
         if cleaned and re.fullmatch(r"[a-z0-9_.-]+", cleaned) and cleaned not in slugs:
             slugs.append(cleaned)
 
+    stem = domain.split(".")[0]
+    if len(stem) >= 3:
+        add(stem)
     for hint in hints:
         add(hint)
-    sld = domain.split(".")[0]
-    if len(sld) >= 3:
-        add(sld)
-    return slugs
+    if not slugs:
+        return []
+    return [slugs[0], *slugs[1:6]]
+
+
+def _rejected_org(org: dict[str, object], domain: str, slug: str) -> str:
+    login = _string(org.get("login")) or slug
+    blog = _blog_domain(org) or "none"
+    email_domain = _email_domain(_string(org.get("email"))) or "none"
+    return (
+        f"GitHub organization {login} (from /orgs/{slug}) was not accepted for {domain}: "
+        f"blog {blog}, email domain {email_domain}."
+    )
+
+
+def _transport_failure(status: int, detail: str | None) -> bool:
+    if status == 0:
+        return True
+    if not detail:
+        return False
+    lowered = detail.lower()
+    return any(token in lowered for token in ("timeout", "network", "not public", "no response", "redirects"))
 
 
 def _is_bot(login: str | None) -> bool:
