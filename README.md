@@ -148,6 +148,7 @@ Verifier status is one of `valid`, `invalid`, `accept_all`, or `unknown`. `accep
 - **Search engines.** DuckDuckGo's HTML endpoint sometimes answers `202` and returns no links. That is reported and, when no other backend is configured, that query contributes nothing. Brave and SearXNG are optional.
 - **Public data only.** A missing email means nothing was published, not that the person has no mailbox. Do not treat a candidate from `email_finder` as a verified address.
 - **Cache.** Successful domain searches are cached for 7 days and verifications for 24 hours. `--refresh` bypasses the result cache. The address index is not part of that cache: it accumulates until you delete the database. A search that failed because GitHub, the website, or the search backend could not be reached is not cached.
+- **Fake-IP DNS.** Some networks answer every lookup with `198.18.0.0/15` and proxy the real connection. OpenHunter connects by hostname in that case instead of pinning the address. User-supplied URLs that resolve to `10/8`, `172.16/12`, `192.168/16`, `127/8`, or link-local stay blocked. Set `OPENHUNTER_TRUST_RESOLVER=1` only when that check should be skipped and `HTTPS_PROXY` / `HTTP_PROXY` should be used.
 
 ## Environment
 
@@ -161,6 +162,7 @@ Verifier status is one of `valid`, `invalid`, `accept_all`, or `unknown`. `accep
 | `OPENHUNTER_SMTP_TIMEOUT` | `5` | Seconds for DNS and SMTP |
 | `OPENHUNTER_DISPOSABLE_FILE` | unset | Extra disposable domains, one per line |
 | `OPENHUNTER_LOG` | `WARNING` | Log level |
+| `OPENHUNTER_TRUST_RESOLVER` | unset | Set to `1` to skip the public-IP check, connect by hostname, and honor `HTTPS_PROXY` / `HTTP_PROXY` |
 
 ## Tests
 
@@ -168,4 +170,4 @@ Verifier status is one of `valid`, `invalid`, `accept_all`, or `unknown`. `accep
 pytest
 ```
 
-The suite covers pattern inference, SMTP interpretation (including a blocked port 25), DNS and null-MX handling, HTML and PDF extraction, sitemap crawls, DuckDuckGo and Brave search, the GitHub org fallback, the address index, the SQLite cache and lead export, the CLI, and both the in-process and stdio MCP servers.
+The suite covers pattern inference, SMTP interpretation (including a blocked port 25), DNS and null-MX handling, fake-IP DNS (`198.18.0.0/15`) and the trusted-resolver opt-in, HTML and PDF extraction, sitemap crawls, DuckDuckGo and Brave search, the GitHub org fallback, the address index, the SQLite cache and lead export, the CLI, and both the in-process and stdio MCP servers.

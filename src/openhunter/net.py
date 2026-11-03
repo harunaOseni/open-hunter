@@ -2,12 +2,15 @@
 
 Fetches and SMTP probes refuse loopback, link-local, and private addresses.
 That keeps a company-domain lookup from being turned into an internal scan
-when a page, redirect, or MX record points at one.
+when a page, redirect, or MX record points at one. Addresses in 198.18.0.0/15
+are the exception when the resolver returns only those: they mean a transparent
+fake-IP DNS proxy, and the connection stays on the hostname.
 """
 
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import socket
 from collections.abc import Callable
@@ -18,6 +21,10 @@ from urllib.parse import urlsplit
 from openhunter.errors import InputError
 
 Resolve = Callable[[str, int | None], list[tuple[object, object, object, tuple[str, int]]]]
+
+# RFC 2544 benchmarking range. Some egress paths publish only these addresses
+# from DNS (a transparent fake-IP proxy). They are not a LAN the caller can scan.
+_BENCHMARK = ipaddress.ip_network("198.18.0.0/15")
 
 _DOMAIN_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$")
 _COMPANY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 .&'+-]{0,80}")
@@ -74,58 +81,92 @@ def parse_query(value: str) -> ParsedQuery:
         return ParsedQuery("invalid", reason=str(exc))
 
 
-def host_is_public(host: str, *, resolve: Resolve | None = None) -> bool:
-    return bool(public_addresses(host, resolve=resolve))
+@dataclass(frozen=True)
+class HostRoute:
+    """How to open a connection without turning DNS into an internal scan.
 
-
-def public_addresses(host: str, *, resolve: Resolve | None = None) -> list[str]:
-    """Global addresses for a host, IPv4 first.
-
-    One private or unreadable record does not hide a public one. Callers connect
-    to an address from this list instead of asking the OS to resolve again, so a
-    broken IPv6 answer or a mixed DNS reply cannot turn a public host into a miss
-    or a private one into a target.
+    ``pin`` connects to the listed global addresses. ``hostname`` lets the OS
+    resolve again, which is required for fake-IP DNS (198.18.0.0/15) and when
+    OPENHUNTER_TRUST_RESOLVER is set. ``blocked`` is a private or local target.
     """
+
+    mode: Literal["pin", "hostname", "blocked"]
+    addresses: tuple[str, ...] = ()
+
+    @property
+    def allowed(self) -> bool:
+        return self.mode != "blocked"
+
+
+def trust_resolver_enabled() -> bool:
+    """True when OPENHUNTER_TRUST_RESOLVER asks us to skip the public-IP check."""
+    raw = os.environ.get("OPENHUNTER_TRUST_RESOLVER", "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def host_is_public(
+    host: str,
+    *,
+    resolve: Resolve | None = None,
+    trust_resolver: bool | None = None,
+) -> bool:
+    return host_route(host, resolve=resolve, trust_resolver=trust_resolver).allowed
+
+
+def public_addresses(
+    host: str,
+    *,
+    resolve: Resolve | None = None,
+    trust_resolver: bool | None = None,
+) -> list[str]:
+    """Global addresses to pin, IPv4 first. Empty when the connection stays on the hostname."""
+    route = host_route(host, resolve=resolve, trust_resolver=trust_resolver)
+    if route.mode != "pin":
+        return []
+    return list(route.addresses)
+
+
+def host_route(
+    host: str,
+    *,
+    resolve: Resolve | None = None,
+    trust_resolver: bool | None = None,
+) -> HostRoute:
+    """Decide whether a host may be contacted, and whether to pin the address.
+
+    Real private ranges (10/8, 172.16/12, 192.168/16, 127/8, link-local) stay
+    blocked. 198.18.0.0/15 is allowed only when every answer from the resolver
+    is in that range, and the caller must then connect by hostname so a
+    transparent fake-IP proxy can see the original name. A literal benchmark
+    address in a URL is still refused. OPENHUNTER_TRUST_RESOLVER=1 skips this
+    check and always connects by hostname.
+    """
+    if trust_resolver is None:
+        trust_resolver = trust_resolver_enabled()
     cleaned = host.strip().lower().rstrip(".")
-    if (
-        not cleaned
-        or cleaned == "localhost"
-        or cleaned.endswith(".localhost")
-        or cleaned.endswith(".local")
-        or cleaned.endswith(".internal")
-    ):
-        return []
-    try:
-        literal = ipaddress.ip_address(cleaned)
-    except ValueError:
-        literal = None
+    if not cleaned:
+        return HostRoute("blocked")
+    if trust_resolver and not _is_special_name(cleaned):
+        return HostRoute("hostname")
+    if _is_special_name(cleaned):
+        return HostRoute("blocked")
+    literal = _parse_ip(cleaned)
     if literal is not None:
-        return [cleaned] if literal.is_global else []
-    resolver = resolve or _resolve
-    try:
-        infos = resolver(cleaned, None)
-    except socket.gaierror:
-        return []
-    ipv4: list[str] = []
-    ipv6: list[str] = []
-    for info in infos:
-        # getaddrinfo returns (family, type, proto, canonname, sockaddr).
-        # The sockaddr is the last item; indexing [3] reads the canonname.
-        try:
-            sockaddr = info[-1]
-            raw = sockaddr[0]
-            if not isinstance(raw, str):
-                continue
-            parsed = ipaddress.ip_address(raw.split("%", 1)[0])
-        except (IndexError, TypeError, ValueError):
-            continue
-        if not parsed.is_global:
-            continue
-        text = str(parsed)
-        bucket = ipv4 if parsed.version == 4 else ipv6
-        if text not in bucket:
-            bucket.append(text)
-    return [*ipv4, *ipv6]
+        if literal.is_global and not _is_benchmark(literal):
+            return HostRoute("pin", (str(literal),))
+        return HostRoute("blocked")
+    parsed = _resolve_ips(cleaned, resolve)
+    if parsed is None:
+        return HostRoute("blocked")
+    global_ips = [ip for ip in parsed if ip.is_global and not _is_benchmark(ip)]
+    if global_ips:
+        ipv4 = [str(ip) for ip in global_ips if ip.version == 4]
+        ipv6 = [str(ip) for ip in global_ips if ip.version == 6]
+        deduped = list(dict.fromkeys([*ipv4, *ipv6]))
+        return HostRoute("pin", tuple(deduped))
+    if parsed and all(_is_benchmark(ip) for ip in parsed):
+        return HostRoute("hostname")
+    return HostRoute("blocked")
 
 
 def validate_fetch_url(url: str, *, domain: str, resolve: Resolve | None = None) -> str | None:
@@ -148,6 +189,53 @@ def validate_fetch_url(url: str, *, domain: str, resolve: Resolve | None = None)
 def same_site(host: str, domain: str) -> bool:
     cleaned = host.strip().lower().rstrip(".")
     return cleaned == domain or cleaned.endswith("." + domain)
+
+
+def _is_special_name(host: str) -> bool:
+    return (
+        host == "localhost"
+        or host.endswith(".localhost")
+        or host.endswith(".local")
+        or host.endswith(".internal")
+    )
+
+
+def _is_benchmark(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return isinstance(ip, ipaddress.IPv4Address) and ip in _BENCHMARK
+
+
+def _parse_ip(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(value.split("%", 1)[0])
+    except ValueError:
+        return None
+
+
+def _resolve_ips(
+    host: str, resolve: Resolve | None
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address] | None:
+    resolver = resolve or _resolve
+    try:
+        infos = resolver(host, None)
+    except socket.gaierror:
+        return None
+    found: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for info in infos:
+        # getaddrinfo returns (family, type, proto, canonname, sockaddr).
+        # The sockaddr is the last item; indexing [3] reads the canonname.
+        try:
+            sockaddr = info[-1]
+            raw = sockaddr[0]
+            if not isinstance(raw, str):
+                continue
+            parsed = _parse_ip(raw)
+        except (IndexError, TypeError, ValueError):
+            continue
+        if parsed is not None and parsed not in found:
+            found.append(parsed)
+    return found
 
 
 def _reject_special_host(host: str) -> None:

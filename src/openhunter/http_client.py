@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from typing import assert_never
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 
-from openhunter.net import host_is_public, public_addresses
+from openhunter.net import HostRoute, host_route, trust_resolver_enabled
 
 USER_AGENT = "openhunter/0.1 (public contact research)"
 
@@ -26,16 +27,24 @@ class FetchResult:
 
 
 class LiveHttp:
-    def __init__(self, delay: float = 0.2, timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        delay: float = 0.2,
+        timeout: float = 10.0,
+        *,
+        trust_resolver: bool | None = None,
+    ) -> None:
         self.delay = delay
         self.timeout = timeout
-        # trust_env is off so an inherited HTTP(S)_PROXY cannot black-hole GitHub
-        # while a direct client still reaches it. Connections are pinned to a
-        # validated public address for the same reason.
+        # trust_env stays off unless OPENHUNTER_TRUST_RESOLVER is set, so an
+        # inherited HTTP(S)_PROXY cannot black-hole GitHub on a normal network.
+        # The opt-in connects by hostname and honors that proxy. Fake-IP DNS
+        # (198.18.0.0/15) also connects by hostname, but still ignores the proxy.
+        self.trust_resolver = trust_resolver_enabled() if trust_resolver is None else trust_resolver
         self._client = httpx.Client(
             timeout=httpx.Timeout(timeout),
             follow_redirects=False,
-            trust_env=False,
+            trust_env=self.trust_resolver,
         )
         self._last = 0.0
 
@@ -54,36 +63,20 @@ class LiveHttp:
         if headers:
             request_headers.update(headers)
         current = url
-        last_error = "network"
         for _ in range(4):
             reason = _unsafe(current)
             if reason:
                 return FetchResult(url, 0, "", current, {}, "", reason)
-            parts = urlsplit(current)
-            host = parts.hostname or ""
-            addresses = public_addresses(host)
-            if not addresses:
+            host = urlsplit(current).hostname or ""
+            route = host_route(host, trust_resolver=self.trust_resolver)
+            if route.mode == "blocked":
                 return FetchResult(url, 0, "", current, {}, "", "host is not public")
-            response = None
-            for address in addresses[:2]:
-                pinned_headers = dict(request_headers)
-                pinned_headers["Host"] = host
-                try:
-                    response = self._client.get(
-                        pinned_url(current, address),
-                        headers=pinned_headers,
-                        timeout=timeout,
-                        extensions={"sni_hostname": host},
-                    )
-                    break
-                except httpx.TimeoutException:
-                    last_error = "timeout"
-                    response = None
-                except httpx.HTTPError:
-                    last_error = "network"
-                    response = None
-            if response is None:
-                return FetchResult(url, 0, "", current, {}, "", last_error)
+            try:
+                response = self._open(current, request_headers, timeout, route)
+            except httpx.TimeoutException:
+                return FetchResult(url, 0, "", current, {}, "", "timeout")
+            except httpx.HTTPError:
+                return FetchResult(url, 0, "", current, {}, "", "network")
             if response.status_code in {301, 302, 303, 307, 308}:
                 location = response.headers.get("location")
                 if not location:
@@ -102,7 +95,48 @@ class LiveHttp:
                 content_type=response_headers.get("content-type", ""),
                 body=raw,
             )
-        return FetchResult(url, 0, "", current, {}, "", "redirects" if last_error == "network" else last_error)
+        return FetchResult(url, 0, "", current, {}, "", "redirects")
+
+    def _open(
+        self,
+        url: str,
+        headers: dict[str, str],
+        timeout: float,
+        route: HostRoute,
+    ) -> httpx.Response:
+        mode = route.mode
+        if mode == "hostname":
+            return self._client.get(url, headers=headers, timeout=timeout)
+        if mode == "pin":
+            return self._open_pinned(url, headers, timeout, route.addresses)
+        if mode == "blocked":
+            raise httpx.HTTPError("host is not public")
+        assert_never(mode)
+
+    def _open_pinned(
+        self,
+        url: str,
+        headers: dict[str, str],
+        timeout: float,
+        addresses: tuple[str, ...],
+    ) -> httpx.Response:
+        host = urlsplit(url).hostname or ""
+        last: httpx.HTTPError | None = None
+        for address in addresses[:2]:
+            pinned_headers = dict(headers)
+            pinned_headers["Host"] = host
+            try:
+                return self._client.get(
+                    pinned_url(url, address),
+                    headers=pinned_headers,
+                    timeout=timeout,
+                    extensions={"sni_hostname": host},
+                )
+            except httpx.HTTPError as exc:
+                last = exc
+        if last is not None:
+            raise last
+        raise httpx.HTTPError("no public address")
 
     def _pace(self) -> None:
         if self.delay <= 0:
@@ -127,7 +161,6 @@ def _unsafe(url: str) -> str | None:
         return "only https URLs are fetched"
     if parts.username or parts.password:
         return "credentials are not fetched"
-    host = parts.hostname or ""
-    if not host or not host_is_public(host):
+    if not parts.hostname:
         return "host is not public"
     return None
