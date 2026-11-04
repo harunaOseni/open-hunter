@@ -120,6 +120,8 @@ Verification of a public commit address reached Google's MX records and then sto
 
 `help@runpod.io` is reported as a role address with the same `unknown` SMTP result. `not an email` is `invalid` with score 0 before any network call. `someone@mailinator.com` is flagged disposable.
 
+A sandbox resolver that answers MX with `NoAnswer` and then an A record in `198.18.0.0/15` is not treated as a mail host. With `OPENHUNTER_DNS_MODE=auto` (the default) the lookup is repeated over DNS-over-HTTPS, Cloudflare then Google, and the real exchanges are used (for a Google Workspace domain those are `aspmx.l.google.com` and the `alt` hosts). If one of those servers accepts TCP and never sends an SMTP greeting, the result is `status` `unknown`, `reason` `smtp_unreachable`, and `mx_valid` true. `valid` is returned only after a real `RCPT` accept and a rejecting probe of a nonexistent mailbox. Nothing is sent.
+
 When a public GitHub profile does publish "First Last", that name is attached to the commit address and can vote in pattern inference. The commit URL stays the source of the address.
 
 ## Sources and the local index
@@ -137,18 +139,18 @@ When nothing is found, the notes list the GitHub URLs that were tried and the HT
 
 Named pattern confidence is `ratio * (1 - 0.55 ** n)`, capped at 0.97. One agreeing named address is 0.45. Three are about 0.83. A structural guess with no names requires at least three addresses and 75% agreement, and it is capped at 0.34 so it cannot outrank a single named match. Role inboxes (`info@`, `help@`, `security@`) are not pattern evidence.
 
-Verifier status is one of `valid`, `invalid`, `accept_all`, or `unknown`. `accept_all` means the server also accepted a random nonexistent mailbox, so a positive `RCPT` does not prove the person exists. `unknown` means the probe could not finish, usually because port 25 was blocked or the server gave a temporary answer.
+Verifier status is one of `valid`, `invalid`, `accept_all`, or `unknown`. `valid` means the server accepted `RCPT` for the address and rejected `RCPT` for a random nonexistent mailbox. `accept_all` means the server also accepted that random mailbox, so a positive `RCPT` does not prove the person exists. `unknown` means the probe could not finish. `reason` says why: `smtp_unreachable` means TCP connected and no SMTP greeting arrived (`mx_valid` is true when the MX host itself was real); other SMTP failures name the port that was tried. `mx_valid` is false when DNS did not produce a public mail host.
 
 ## Limits
 
-- **Port 25.** Many networks, including this demo environment and most cloud hosts, block outbound SMTP. OpenHunter reports `unknown` and does not pretend the mailbox was confirmed. Set `OPENHUNTER_SMTP=0` to skip the probe and keep the syntax, MX, disposable, and role checks.
+- **Port 25.** Many networks, including this demo environment and most cloud hosts, block outbound SMTP. A filter that accepts TCP and never sends a greeting is `unknown` with `reason` `smtp_unreachable`, not `valid`. Set `OPENHUNTER_SMTP_PORT` to probe another port and `OPENHUNTER_SMTP_TIMEOUT` to change how long each attempt, including the greeting, is allowed to wait. Set `OPENHUNTER_SMTP=0` to skip the probe and keep the syntax, MX, disposable, and role checks.
 - **Catch-all domains.** A domain that accepts every recipient cannot be used to prove an address. Status is `accept_all` and the score stays modest.
 - **GitHub quota and terms.** Unauthenticated requests are 60 per hour per IP. A token (`GITHUB_TOKEN` or `GH_TOKEN`) raises that to 5,000. One domain search looks at the org, public members, up to 5 recently pushed public repos, 15 commits each, and up to 12 profiles. Noreply addresses and bot authors are dropped. Use the official REST API only, and follow GitHub's terms.
 - **Polite crawling.** `robots.txt` is honored on the company site and on search-result hosts. There is a short delay between requests. The company-site budget is 12 HTML responses, including sitemaps, and 3 PDFs. Web search adds at most 3 queries and 6 pages. Nothing behind a login is fetched.
 - **Search engines.** DuckDuckGo's HTML endpoint sometimes answers `202` and returns no links. That is reported and, when no other backend is configured, that query contributes nothing. Brave and SearXNG are optional.
 - **Public data only.** A missing email means nothing was published, not that the person has no mailbox. Do not treat a candidate from `email_finder` as a verified address.
 - **Cache.** Successful domain searches are cached for 7 days and verifications for 24 hours. `--refresh` bypasses the result cache. The address index is not part of that cache: it accumulates until you delete the database. A search that failed because GitHub, the website, or the search backend could not be reached is not cached.
-- **Fake-IP DNS.** Some networks answer every lookup with `198.18.0.0/15` and proxy the real connection. OpenHunter connects by hostname in that case instead of pinning the address. User-supplied URLs that resolve to `10/8`, `172.16/12`, `192.168/16`, `127/8`, or link-local stay blocked. Set `OPENHUNTER_TRUST_RESOLVER=1` only when that check should be skipped and `HTTPS_PROXY` / `HTTP_PROXY` should be used.
+- **Fake-IP DNS.** Some networks answer every lookup with `198.18.0.0/15` and proxy the real connection. OpenHunter connects by hostname in that case instead of pinning the address. Those addresses, and other private or non-global addresses, are not used as implicit MX hosts. `OPENHUNTER_DNS_MODE=auto` (the default) asks Cloudflare and then Google over DNS-over-HTTPS when the system resolver returns no MX, times out, or only those addresses. `system` stays on the system resolver. `doh` skips it. User-supplied URLs that resolve to `10/8`, `172.16/12`, `192.168/16`, `127/8`, or link-local stay blocked. Set `OPENHUNTER_TRUST_RESOLVER=1` only when that check should be skipped and `HTTPS_PROXY` / `HTTP_PROXY` should be used.
 
 ## Environment
 
@@ -158,8 +160,10 @@ Verifier status is one of `valid`, `invalid`, `accept_all`, or `unknown`. `accep
 | `BRAVE_SEARCH_API_KEY` or `BRAVE_API_KEY` | unset | Use the Brave Search API instead of DuckDuckGo |
 | `SEARXNG_URL` | unset | SearXNG base URL, for example `https://search.example` |
 | `OPENHUNTER_DB` | `~/.local/share/openhunter/openhunter.db` | SQLite cache, address index, and leads |
+| `OPENHUNTER_DNS_MODE` | `auto` | `system` uses the OS resolver. `doh` uses DNS-over-HTTPS (Cloudflare, then Google). `auto` tries the OS resolver and repeats the query over DNS-over-HTTPS on NoAnswer, timeout, or a private/fake-IP answer |
 | `OPENHUNTER_SMTP` | on | Set to `0` to skip the RCPT probe |
-| `OPENHUNTER_SMTP_TIMEOUT` | `5` | Seconds for DNS and SMTP |
+| `OPENHUNTER_SMTP_PORT` | `25` | TCP port for the SMTP greeting and RCPT probe |
+| `OPENHUNTER_SMTP_TIMEOUT` | `5` | Seconds for each DNS query and each SMTP attempt, including the wait for a greeting |
 | `OPENHUNTER_DISPOSABLE_FILE` | unset | Extra disposable domains, one per line |
 | `OPENHUNTER_LOG` | `WARNING` | Log level |
 | `OPENHUNTER_TRUST_RESOLVER` | unset | Set to `1` to skip the public-IP check, connect by hostname, and honor `HTTPS_PROXY` / `HTTP_PROXY` |
@@ -170,4 +174,4 @@ Verifier status is one of `valid`, `invalid`, `accept_all`, or `unknown`. `accep
 pytest
 ```
 
-The suite covers pattern inference, SMTP interpretation (including a blocked port 25), DNS and null-MX handling, fake-IP DNS (`198.18.0.0/15`) and the trusted-resolver opt-in, HTML and PDF extraction, sitemap crawls, DuckDuckGo and Brave search, the GitHub org fallback, the address index, the SQLite cache and lead export, the CLI, and both the in-process and stdio MCP servers.
+The suite covers pattern inference, SMTP interpretation (including a blocked port, a missing SMTP greeting, and a configurable port), DNS and null-MX handling, DNS-over-HTTPS fallback for a Google Workspace MX, rejection of private and fake-IP address fallbacks, fake-IP DNS (`198.18.0.0/15`) and the trusted-resolver opt-in, HTML and PDF extraction, sitemap crawls, DuckDuckGo and Brave search, the GitHub org fallback, the address index, the SQLite cache and lead export, the CLI, and both the in-process and stdio MCP servers.

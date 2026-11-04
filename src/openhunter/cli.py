@@ -170,7 +170,8 @@ def _print_candidates(payload: dict[str, object]) -> None:
 def _print_verification(payload: dict[str, object]) -> None:
     print(
         f"{payload.get('email')}  {payload.get('status')}  score {payload.get('score')}  "
-        f"disposable={payload.get('is_disposable')}  role={payload.get('is_role')}"
+        f"disposable={payload.get('is_disposable')}  role={payload.get('is_role')}  "
+        f"mx_valid={payload.get('mx_valid')}  reason={payload.get('reason') or '-'}"
     )
     notes = payload.get("notes")
     if isinstance(notes, list):

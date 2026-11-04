@@ -113,6 +113,23 @@ def host_is_public(
     return host_route(host, resolve=resolve, trust_resolver=trust_resolver).allowed
 
 
+def is_public_unicast(value: str) -> bool:
+    """True when ``value`` is a literal global address outside 198.18.0.0/15.
+
+    Implicit MX (an A/AAAA record used because the domain published no MX) may
+    use only these addresses. Hostnames are not addresses and return False.
+    Private, loopback, link-local, shared, and benchmark ranges are not mail
+    hosts, including the 198.18.0.1 answers a fake-IP resolver returns for
+    every name.
+    """
+    parsed = _parse_ip(value.strip().rstrip("."))
+    if parsed is None:
+        return False
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
+        parsed = parsed.ipv4_mapped
+    return bool(parsed.is_global and not _is_benchmark(parsed))
+
+
 def public_addresses(
     host: str,
     *,

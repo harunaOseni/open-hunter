@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from openhunter.dns_lookup import DnspythonResolver
+from openhunter.dns_lookup import DnsResolver
 from openhunter.errors import InputError
 from openhunter.github_api import GitHubSource
 from openhunter.http_client import LiveHttp
@@ -15,7 +15,7 @@ from openhunter.net import host_is_public, normalize_domain, parse_query
 from openhunter.patterns import KnownEmail, PatternInference, PatternVote, generate_candidates, infer_pattern
 from openhunter.roles import is_role_address
 from openhunter.search_web import SearchFindings, WebSearchSource
-from openhunter.smtp_probe import LiveSmtpProber
+from openhunter.smtp_probe import LiveSmtpProber, configured_smtp_port
 from openhunter.store import Store
 from openhunter.syntax import check_syntax
 from openhunter.verifier import Verification, verify_email
@@ -315,8 +315,9 @@ def _inference_from(payload: object, domain: str) -> PatternInference | None:
 
 def _live_verifier():
     timeout = _float_env("OPENHUNTER_SMTP_TIMEOUT", 5.0)
+    port = configured_smtp_port()
     smtp_enabled = os.environ.get("OPENHUNTER_SMTP", "1").lower() not in {"0", "false", "no", "off"}
-    resolver = DnspythonResolver(timeout=timeout)
+    resolver = DnsResolver(timeout=timeout)
     prober = LiveSmtpProber(timeout=timeout, host_checker=host_is_public)
     extra = _disposable_file()
 
@@ -329,6 +330,7 @@ def _live_verifier():
             disposable_domains=extra,
             smtp_enabled=smtp_enabled,
             timeout=timeout,
+            smtp_port=port,
         )
 
     return verify

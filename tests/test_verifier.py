@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import socket
 import threading
+import time
+from collections.abc import Callable
 
 import pytest
 
-from openhunter.smtp_probe import LiveSmtpProber
+from openhunter.smtp_probe import LiveSmtpProber, configured_smtp_port
 from openhunter.verifier import MxLookup, SmtpReply, verify_email
 
 
@@ -30,8 +32,15 @@ class ScriptedSmtp:
         self.handler = handler
         self.calls: list[str] = []
 
-    def probe_mailbox(self, mx_hosts: list[str], recipient: str, *, timeout: float) -> SmtpReply:
-        del mx_hosts, timeout
+    def probe_mailbox(
+        self,
+        mx_hosts: list[str],
+        recipient: str,
+        *,
+        timeout: float,
+        port: int = 25,
+    ) -> SmtpReply:
+        del mx_hosts, timeout, port
         self.calls.append(recipient)
         return self.handler(recipient)
 
@@ -100,6 +109,8 @@ def test_accepts_a_normal_address_and_probes_the_normalized_form() -> None:
     assert result.score == 96
     assert result.catch_all is False
     assert result.smtp_code == 250
+    assert result.mx_valid is True
+    assert result.reason is None
     assert resolver.calls == ["example.com"]
 
 
@@ -234,6 +245,8 @@ def test_port_25_unreachable_is_unknown_with_an_honest_note() -> None:
     result = _verify("ada@example.com", resolver, prober)
     assert result.status == "unknown"
     assert result.score == 40
+    assert result.mx_valid is True
+    assert result.reason == "timeout"
     assert result.mx_hosts == ("mx.example.com", "mx2.example.com")
     note = " ".join(result.notes).lower()
     assert "port 25" in note
@@ -333,3 +346,224 @@ def test_live_probe_reports_connection_refused() -> None:
     reply = prober.probe_mailbox(["127.0.0.1"], "ada@example.com", timeout=1, port=closed)
     assert reply.code is None
     assert reply.error in {"refused", "blocked", "unreachable", "timeout"}
+
+
+def test_smtp_port_and_timeout_are_forwarded_to_the_probe() -> None:
+    seen: dict[str, object] = {}
+
+    class Capture:
+        def probe_mailbox(self, mx_hosts: list[str], recipient: str, *, timeout: float, port: int = 25) -> SmtpReply:
+            seen["hosts"] = tuple(mx_hosts)
+            seen["recipient"] = recipient
+            seen["timeout"] = timeout
+            seen["port"] = port
+            return SmtpReply(550, "no such user", None)
+
+    result = verify_email(
+        "ada@example.com",
+        resolver=FixedMx(MxLookup(hosts=("aspmx.l.google.com",))),
+        prober=Capture(),
+        host_checker=lambda host: True,
+        timeout=2.5,
+        smtp_port=587,
+    )
+    assert result.status == "invalid"
+    assert seen == {
+        "hosts": ("aspmx.l.google.com",),
+        "recipient": "ada@example.com",
+        "timeout": 2.5,
+        "port": 587,
+    }
+
+
+def test_unreachable_note_names_the_configured_port() -> None:
+    resolver = FixedMx(MxLookup(hosts=("aspmx.l.google.com",)))
+    prober = ScriptedSmtp(lambda recipient: SmtpReply(None, "", "timeout"))
+    result = verify_email(
+        "ada@example.com",
+        resolver=resolver,
+        prober=prober,
+        host_checker=lambda host: True,
+        smtp_port=587,
+    )
+    assert result.status == "unknown"
+    assert result.mx_valid is True
+    assert "587" in " ".join(result.notes)
+    assert result.status != "valid"
+
+
+def test_banner_code_without_an_rcpt_result_is_not_valid() -> None:
+    resolver = FixedMx(MxLookup(hosts=("aspmx.l.google.com",)))
+    prober = ScriptedSmtp(lambda recipient: SmtpReply(250, "not an rcpt", "protocol"))
+    result = _verify("ada@example.com", resolver, prober)
+    assert result.status == "unknown"
+    assert result.status != "valid"
+    assert result.mx_valid is True
+    assert prober.calls == ["ada@example.com"]
+
+
+def test_smtp_unreachable_is_unknown_with_mx_still_valid() -> None:
+    resolver = FixedMx(MxLookup(hosts=("aspmx.l.google.com", "alt1.aspmx.l.google.com")))
+    prober = ScriptedSmtp(lambda recipient: SmtpReply(None, "", "smtp_unreachable"))
+    result = _verify("ada@anthropic.com", resolver, prober)
+    assert result.status == "unknown"
+    assert result.reason == "smtp_unreachable"
+    assert result.mx_valid is True
+    assert result.smtp_code is None
+    assert result.mx_hosts[0] == "aspmx.l.google.com"
+    assert result.catch_all is None
+    assert prober.calls == ["ada@anthropic.com"]
+    note = " ".join(result.notes).lower()
+    assert "greeting" in note
+    assert "not verified" in note
+
+
+def test_missing_greeting_tries_the_next_mail_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    def fake(host: str, port: int, recipient: str, timeout: float, mail_from: str, helo: str) -> SmtpReply:
+        del port, recipient, timeout, mail_from, helo
+        calls.append(host)
+        if host == "mx1.example":
+            return SmtpReply(250, "not a greeting", "protocol")
+        return SmtpReply(250, "2.1.5 OK", None)
+
+    monkeypatch.setattr("openhunter.smtp_probe._probe_one", fake)
+    prober = LiveSmtpProber(host_checker=lambda host: True)
+    reply = prober.probe_mailbox(
+        ["mx1.example", "mx2.example"], "ada@example.com", timeout=1, port=2525
+    )
+    assert calls == ["mx1.example", "mx2.example"]
+    assert reply.code == 250
+    assert reply.error is None
+
+
+def test_configured_smtp_port_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENHUNTER_SMTP_PORT", raising=False)
+    assert configured_smtp_port() == 25
+    monkeypatch.setenv("OPENHUNTER_SMTP_PORT", "587")
+    assert configured_smtp_port() == 587
+    monkeypatch.setenv("OPENHUNTER_SMTP_PORT", "0")
+    assert configured_smtp_port() == 25
+    monkeypatch.setenv("OPENHUNTER_SMTP_PORT", "nope")
+    assert configured_smtp_port() == 25
+
+
+class _LocalSmtp:
+    """Accepts on 127.0.0.1 and runs ``talk`` for each connection."""
+
+    def __init__(self, talk: Callable[[socket.socket, threading.Event], None]) -> None:
+        self._talk = talk
+        self.release = threading.Event()
+        self.ready = threading.Event()
+        self.port = 0
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def __enter__(self) -> _LocalSmtp:
+        self._thread.start()
+        assert self.ready.wait(2)
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.release.set()
+        self._thread.join(2)
+
+    def _run(self) -> None:
+        server = socket.socket()
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(4)
+        server.settimeout(0.2)
+        self.port = server.getsockname()[1]
+        self.ready.set()
+        try:
+            while not self.release.is_set():
+                try:
+                    conn, _addr = server.accept()
+                except socket.timeout:
+                    continue
+                try:
+                    self._talk(conn, self.release)
+                finally:
+                    conn.close()
+        finally:
+            server.close()
+
+
+def _hold(conn: socket.socket, release: threading.Event) -> None:
+    del conn
+    release.wait(3)
+
+
+def _banner_then_hold(conn: socket.socket, release: threading.Event) -> None:
+    conn.sendall(b"220 test.example ESMTP\r\n")
+    release.wait(3)
+
+
+def _false_banner(conn: socket.socket, release: threading.Event) -> None:
+    conn.sendall(b"250 not a greeting\r\n")
+    release.wait(3)
+
+
+def test_live_greeting_timeout_is_smtp_unreachable_and_not_valid() -> None:
+    with _LocalSmtp(_hold) as server:
+        started = time.monotonic()
+        result = verify_email(
+            "ada@anthropic.com",
+            resolver=FixedMx(MxLookup(hosts=("127.0.0.1",))),
+            prober=LiveSmtpProber(timeout=0.3, host_checker=lambda host: True),
+            host_checker=lambda host: True,
+            timeout=0.3,
+            smtp_port=server.port,
+        )
+        elapsed = time.monotonic() - started
+    assert elapsed < 1.2
+    assert result.status == "unknown"
+    assert result.reason == "smtp_unreachable"
+    assert result.mx_valid is True
+    assert result.smtp_code is None
+    assert result.status != "valid"
+    assert "greeting" in " ".join(result.notes).lower()
+
+
+def test_live_timeout_after_a_greeting_is_not_the_greeting_failure() -> None:
+    with _LocalSmtp(_banner_then_hold) as server:
+        prober = LiveSmtpProber(timeout=0.3, host_checker=lambda host: True)
+        started = time.monotonic()
+        reply = prober.probe_mailbox(["127.0.0.1"], "ada@example.com", timeout=0.3, port=server.port)
+        elapsed = time.monotonic() - started
+    assert elapsed < 1.2
+    assert reply.code is None
+    assert reply.error == "timeout"
+
+
+def test_live_non_greeting_banner_is_not_an_rcpt_success() -> None:
+    with _LocalSmtp(_false_banner) as server:
+        prober = LiveSmtpProber(timeout=0.4, host_checker=lambda host: True)
+        reply = prober.probe_mailbox(["127.0.0.1"], "ada@example.com", timeout=0.4, port=server.port)
+    assert reply.error == "protocol"
+    assert reply.code == 250
+    result = verify_email(
+        "ada@example.com",
+        resolver=FixedMx(MxLookup(hosts=("127.0.0.1",))),
+        prober=_StaticProber(reply),
+        host_checker=lambda host: True,
+    )
+    assert result.status == "unknown"
+    assert result.status != "valid"
+
+
+class _StaticProber:
+    def __init__(self, reply: SmtpReply) -> None:
+        self.reply = reply
+
+    def probe_mailbox(
+        self,
+        mx_hosts: list[str],
+        recipient: str,
+        *,
+        timeout: float,
+        port: int = 25,
+    ) -> SmtpReply:
+        del mx_hosts, recipient, timeout, port
+        return self.reply

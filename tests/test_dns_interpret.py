@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from openhunter.dns_lookup import interpret_mx
 
 
@@ -22,6 +24,35 @@ def test_address_fallback_when_no_mx_exists() -> None:
     looked = interpret_mx([], ["1.1.1.1", "1.1.1.1"], None)
     assert looked.hosts == ("1.1.1.1",)
     assert looked.implicit_a is True
+
+
+def test_public_address_is_kept_beside_a_fake_ip() -> None:
+    looked = interpret_mx([], ["198.18.0.1", "1.1.1.1", "1.1.1.1"], None)
+    assert looked.hosts == ("1.1.1.1",)
+    assert looked.implicit_a is True
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "198.18.0.1",
+        "198.19.255.1",
+        "10.0.0.8",
+        "172.16.0.1",
+        "192.168.1.9",
+        "127.0.0.1",
+        "169.254.169.254",
+        "100.64.0.1",
+        "::1",
+        "fe80::1",
+        "::ffff:198.18.0.1",
+    ],
+)
+def test_private_and_fake_ip_addresses_are_not_mail_hosts(address: str) -> None:
+    looked = interpret_mx([], [address], None)
+    assert looked.hosts == ()
+    assert looked.implicit_a is False
+    assert looked.null_mx is False
 
 
 def test_dns_error_is_preserved() -> None:
