@@ -29,6 +29,8 @@ RCPT accept and a rejecting catch-all probe. status accept_all means the domain
 accepts every address, so a positive RCPT does not prove the person exists.
 OPENHUNTER_DNS_MODE=auto (the default) repeats MX lookups over DNS-over-HTTPS when
 the system resolver times out, returns no MX, or answers with a private or fake IP.
+record_outcome and import_outcomes teach email_pattern and email_finder which
+formats actually deliver at a domain; a domain can use several weighted patterns.
 Save people you intend to contact with save_lead. Verification results and searches
 are cached in a local SQLite file.
 """.strip()
@@ -149,6 +151,37 @@ def build_server() -> MCPServer:
     def export_leads(path: str, domain: str | None = None) -> dict[str, Any]:
         """Write saved leads to a CSV file and return the path and row count."""
         return _call(lambda service: service.export_leads(path, domain=domain))
+
+    @server.tool(annotations=_WRITE)
+    def record_outcome(
+        email: str,
+        status: str,
+        name: str | None = None,
+        first_name: str | None = None,
+        last_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Record whether a sent email was delivered or bounced.
+
+        status is delivered or bounced. Give the person's name so the outcome
+        can be matched to a mailbox pattern. Delivered outcomes raise that
+        pattern's weight for the domain; a bounce excludes the address and its
+        pattern for that person in email_finder. A bounce is never overwritten
+        by a later delivered record for the same address.
+        """
+        return _call(
+            lambda service: service.record_outcome(
+                email, status, name=name, first_name=first_name, last_name=last_name
+            )
+        )
+
+    @server.tool(annotations=_WRITE)
+    def import_outcomes(path: str, sheet: str = "Outreach") -> dict[str, Any]:
+        """Bulk import delivery outcomes from an outreach tracker workbook (.xlsx).
+
+        Reads column B (name), C (address) and F (status). Bounced is a bounce;
+        Sent is delivered unless the same address is also marked Bounced.
+        """
+        return _call(lambda service: service.import_outcomes(path, sheet=sheet))
 
     return server
 

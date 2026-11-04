@@ -19,6 +19,8 @@ EXPECTED = {
     "save_lead",
     "list_leads",
     "export_leads",
+    "record_outcome",
+    "import_outcomes",
 }
 
 
