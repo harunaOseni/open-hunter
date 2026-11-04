@@ -22,9 +22,13 @@ Use domain_search with a company domain (runpod.io) or a company name.
 email_pattern reports the mailbox format those public addresses support.
 email_finder ranks likely addresses for one person; a candidate is not a confirmed mailbox.
 email_verifier checks syntax, MX, disposable and role inboxes, then probes SMTP RCPT
-without sending mail. status unknown usually means outbound port 25 is blocked or the
-server gave a temporary answer. status accept_all means the domain accepts every
-address, so a positive RCPT does not prove the person exists.
+without sending mail. status unknown usually means outbound SMTP is blocked, the
+server accepted TCP but sent no greeting (reason smtp_unreachable, mx_valid true),
+or the server gave a temporary answer. status valid is only returned after a real
+RCPT accept and a rejecting catch-all probe. status accept_all means the domain
+accepts every address, so a positive RCPT does not prove the person exists.
+OPENHUNTER_DNS_MODE=auto (the default) repeats MX lookups over DNS-over-HTTPS when
+the system resolver times out, returns no MX, or answers with a private or fake IP.
 Save people you intend to contact with save_lead. Verification results and searches
 are cached in a local SQLite file.
 """.strip()
@@ -100,9 +104,10 @@ def build_server() -> MCPServer:
 
         Runs syntax, MX lookup, disposable-domain and role-address detection,
         then an SMTP RCPT probe with a catch-all check. status is valid,
-        invalid, accept_all, or unknown. unknown with a port 25 note means the
-        probe could not reach the mail server. accept_all means the domain
-        accepted a nonexistent mailbox too.
+        invalid, accept_all, or unknown. valid requires a real RCPT accept.
+        unknown with reason smtp_unreachable means TCP connected and no SMTP
+        greeting arrived (mx_valid is true when the MX host itself was real).
+        accept_all means the domain accepted a nonexistent mailbox too.
         """
         return _call(lambda service: service.email_verifier(email, refresh=refresh))
 

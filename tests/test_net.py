@@ -9,6 +9,7 @@ from openhunter.http_client import pinned_url
 from openhunter.net import (
     host_is_public,
     host_route,
+    is_public_unicast,
     normalize_domain,
     parse_query,
     public_addresses,
@@ -147,6 +148,14 @@ def test_benchmark_dns_uses_the_hostname_and_is_allowed() -> None:
     assert (
         validate_fetch_url("https://www.runpod.io/team", domain="runpod.io", resolve=resolve) is None
     )
+
+
+def test_public_unicast_rejects_fake_ip_and_private_ranges() -> None:
+    assert is_public_unicast("1.1.1.1") is True
+    assert is_public_unicast("2001:4860:4860::8888") is True
+    assert is_public_unicast("aspmx.l.google.com") is False
+    for address in ("198.18.0.1", "198.19.1.8", "10.1.2.3", "172.16.0.1", "127.0.0.1", "::ffff:198.18.0.1"):
+        assert is_public_unicast(address) is False
 
 
 def test_literal_benchmark_address_stays_blocked() -> None:
