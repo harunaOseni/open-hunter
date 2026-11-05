@@ -12,6 +12,14 @@ from openhunter.http_client import LiveHttp
 from openhunter.models import Person, merge_people, to_plain
 from openhunter.names import split_name
 from openhunter.net import host_is_public, normalize_domain, parse_query
+from openhunter.outcomes import (
+    rerank,
+    Outcome,
+    exclusions_for,
+    make_outcome,
+    read_outreach_sheet,
+    weigh_patterns,
+)
 from openhunter.patterns import KnownEmail, PatternInference, PatternVote, generate_candidates, infer_pattern
 from openhunter.roles import is_role_address
 from openhunter.search_web import SearchFindings, WebSearchSource
@@ -137,6 +145,7 @@ class OpenHunter:
         pattern = found.get("pattern")
         result = dict(pattern) if isinstance(pattern, dict) else {}
         result["from_cache"] = found["from_cache"]
+        result["weighted_patterns"] = self._weighted(str(found["domain"]), result)
         return result
 
     def email_finder(self, first_name: str, last_name: str, domain: str) -> dict[str, object]:
@@ -145,14 +154,56 @@ class OpenHunter:
             raise InputError("email_finder needs a domain that resolved to a website.")
         resolved = str(found["domain"])
         inference = _inference_from(found.get("pattern"), resolved)
-        candidates = generate_candidates(first_name, last_name, resolved, inference)
+        pool = generate_candidates(first_name, last_name, resolved, inference, limit=64)
+        pattern = found.get("pattern")
+        weighted = self._weighted(resolved, pattern if isinstance(pattern, dict) else {})
+        outcomes = self._outcomes(resolved)
+        excluded = exclusions_for(first_name, last_name, resolved, outcomes)
+        candidates = rerank(pool, weighted, excluded.emails, excluded.patterns)[:8]
         return {
             "domain": resolved,
             "first_name": first_name.strip(),
             "last_name": last_name.strip(),
-            "pattern": found.get("pattern"),
+            "pattern": pattern,
+            "weighted_patterns": weighted,
+            "excluded": {"emails": sorted(excluded.emails), "patterns": sorted(excluded.patterns)},
             "candidates": [to_plain(candidate) for candidate in candidates],
         }
+
+    def record_outcome(
+        self,
+        email: str,
+        status: str,
+        name: str | None = None,
+        first_name: str | None = None,
+        last_name: str | None = None,
+    ) -> dict[str, object]:
+        outcome = make_outcome(email, status, name=name, first_name=first_name, last_name=last_name)
+        self.store.record_outcomes([outcome], source="record_outcome")
+        return {"email": outcome.email, "domain": outcome.domain, "status": outcome.status,
+                "first_name": outcome.first_name, "last_name": outcome.last_name}
+
+    def import_outcomes(self, path: str, sheet: str = "Outreach") -> dict[str, object]:
+        outcomes = read_outreach_sheet(Path(path).expanduser(), sheet=sheet)
+        self.store.record_outcomes(outcomes, source=f"xlsx:{Path(path).name}")
+        counts = {"delivered": 0, "bounced": 0}
+        for outcome in outcomes:
+            counts[outcome.status] += 1
+        return {"path": str(path), "sheet": sheet, "imported": len(outcomes), **counts}
+
+    def _outcomes(self, domain: str) -> list[Outcome]:
+        return [
+            Outcome(str(row["email"]), str(row["status"]), row.get("first_name"), row.get("last_name"))
+            for row in self.store.outcomes_for_domain(domain)
+        ]
+
+    def _weighted(self, domain: str, pattern: dict[str, object]) -> list[dict[str, object]]:
+        votes = [
+            PatternVote(str(item["pattern"]), int(item["matched_count"]))
+            for item in pattern.get("alternates") or []
+            if isinstance(item, dict)
+        ]
+        return [to_plain(row) for row in weigh_patterns(domain, self._outcomes(domain), votes)]
 
     def email_verifier(self, email: str, refresh: bool = False) -> dict[str, object]:
         syntax = check_syntax(email)

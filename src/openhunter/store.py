@@ -62,6 +62,16 @@ class Store:
                     PRIMARY KEY (email, source_url)
                 );
                 CREATE INDEX IF NOT EXISTS address_index_domain ON address_index (domain, last_seen);
+                CREATE TABLE IF NOT EXISTS delivery_outcomes (
+                    email TEXT PRIMARY KEY,
+                    domain TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    first_name TEXT,
+                    last_name TEXT,
+                    source TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS delivery_outcomes_domain ON delivery_outcomes (domain);
                 CREATE TABLE IF NOT EXISTS leads (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     dedupe_key TEXT NOT NULL UNIQUE,
@@ -166,6 +176,36 @@ class Store:
                 written += 1
             connection.commit()
         return written
+
+    def record_outcomes(self, outcomes: list[object], *, source: str, now: datetime | None = None) -> int:
+        """Upsert delivery outcomes. A bounce is never overwritten by a later delivered row."""
+        moment = (now or _now()).isoformat()
+        with closing(self._connect()) as connection:
+            for outcome in outcomes:
+                connection.execute(
+                    """
+                    INSERT INTO delivery_outcomes (email, domain, status, first_name, last_name, source, recorded_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(email) DO UPDATE SET
+                        status = CASE WHEN delivery_outcomes.status = 'bounced' THEN 'bounced' ELSE excluded.status END,
+                        first_name = COALESCE(excluded.first_name, delivery_outcomes.first_name),
+                        last_name = COALESCE(excluded.last_name, delivery_outcomes.last_name),
+                        source = excluded.source,
+                        recorded_at = excluded.recorded_at
+                    """,
+                    (outcome.email, outcome.domain, outcome.status, outcome.first_name,
+                     outcome.last_name, source, moment),
+                )
+            connection.commit()
+        return len(outcomes)
+
+    def outcomes_for_domain(self, domain: str) -> list[dict[str, object]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT email, status, first_name, last_name FROM delivery_outcomes WHERE domain = ? ORDER BY email",
+                (domain.strip().lower(),),
+            ).fetchall()
+        return [{key: row[key] for key in row.keys()} for row in rows]
 
     def addresses_for_domain(self, domain: str, *, limit: int = 200) -> list[dict[str, object]]:
         bounded = max(1, min(int(limit), 500))

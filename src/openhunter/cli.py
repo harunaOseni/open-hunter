@@ -75,6 +75,10 @@ def _dispatch(service: OpenHunter, args: argparse.Namespace) -> dict[str, object
         return service.list_leads(domain=args.domain, limit=args.limit)
     if args.command == "leads" and args.lead_command == "export":
         return service.export_leads(args.path, domain=args.domain)
+    if args.command == "outcomes" and args.outcome_command == "record":
+        return service.record_outcome(args.email, args.status, name=args.name)
+    if args.command == "outcomes" and args.outcome_command == "import":
+        return service.import_outcomes(args.path, sheet=args.sheet)
     raise SystemExit(2)
 
 
@@ -244,6 +248,18 @@ def _parser() -> argparse.ArgumentParser:
     export.add_argument("path")
     export.add_argument("--domain")
     _json_flag(export)
+
+    outcomes = commands.add_parser("outcomes", help="Record delivered or bounced sends")
+    outcome_commands = outcomes.add_subparsers(dest="outcome_command", required=True)
+    record = outcome_commands.add_parser("record")
+    record.add_argument("email")
+    record.add_argument("status", choices=["delivered", "bounced"])
+    record.add_argument("--name")
+    _json_flag(record)
+    importer = outcome_commands.add_parser("import", help="Import an outreach tracker .xlsx")
+    importer.add_argument("path")
+    importer.add_argument("--sheet", default="Outreach")
+    _json_flag(importer)
 
     commands.add_parser("mcp", help="Run the MCP stdio server")
     return parser
